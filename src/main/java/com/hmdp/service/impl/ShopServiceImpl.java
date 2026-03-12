@@ -8,6 +8,7 @@ import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.RedisConstants;
+import org.springframework.boot.autoconfigure.cache.CacheProperties;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -42,10 +43,17 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             return Result.ok(shop);
         }
 
+        // add: 命中的是否是空值
+        if(shopJson != null) {
+            return Result.fail("店铺信息不存在!");
+        }
+
         // 4.不存在，则查询数据库
         Shop shop = getById(id);
         // 5.数据库中不存在，返回错误
         if(shop == null) {
+            // add:空值写入redis
+            stringRedisTemplate.opsForValue().set(key, "", RedisConstants.CACHE_NULL_TTL, TimeUnit.MINUTES);
             return Result.fail("店铺不存在!");
         }
         // 6.存在，写入Redis
