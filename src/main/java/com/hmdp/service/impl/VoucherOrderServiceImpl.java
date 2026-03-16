@@ -1,5 +1,6 @@
 package com.hmdp.service.impl;
 
+import cn.hutool.core.bean.BeanUtil;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.VoucherOrderMapper;
@@ -8,11 +9,14 @@ import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.UserHolder;
+import lombok.extern.slf4j.Slf4j;
+import lombok.val;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.aop.framework.AopContext;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
@@ -20,7 +24,10 @@ import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
+import java.time.Duration;
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.*;
 
 /**
@@ -32,6 +39,7 @@ import java.util.concurrent.*;
  * @since 2021-12-22
  */
 @Service
+@Slf4j
 public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
 
     @Resource
@@ -53,13 +61,89 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         SECKILL_SCRIPT.setResultType(Long.class);
     }
 
-    private BlockingQueue <VoucherOrder> voucherOrderQueue = new ArrayBlockingQueue<>(1024 * 1024);
+    private static final DefaultRedisScript<Long> SECKILL_SCRIPT_FOR_MQ;
+    static {
+        SECKILL_SCRIPT_FOR_MQ = new DefaultRedisScript<>();
+        SECKILL_SCRIPT_FOR_MQ.setLocation(new ClassPathResource("seckillForMq.lua"));
+        SECKILL_SCRIPT_FOR_MQ.setResultType(Long.class);
+    }
+
     private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
 
     @PostConstruct
     private void init() {
         SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
     }
+
+    private class VoucherOrderHandler implements Runnable {
+        String queueName = "stream.orders";
+        @Override
+        public void run() {
+            while (true) {
+                try {
+                    // 1.获取消息队列中的订单信息
+                    List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
+                            Consumer.from("g1", "c1"),
+                            StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
+                            StreamOffset.create(queueName, ReadOffset.lastConsumed())
+                    );
+                    // 2.判断消息获取是否成功
+                    if(list == null || list.isEmpty()) {
+                        //获取失败
+                        continue;
+                    }
+                    // 3.解析订单
+                    MapRecord<String, Object, Object> record = list.get(0);
+                    Map<Object, Object> values = record.getValue();
+                    VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(values, new VoucherOrder(), true);
+                    // 3.创建订单
+                    handleVoucherOrder(voucherOrder);
+                    // 4.ack确认
+                    stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
+                } catch (Exception e) {
+                    log.error("处理订单异常", e);
+                    handlePendingList();
+                }
+            }
+
+        }
+
+        private void handlePendingList() {
+            while (true) {
+                try {
+                    // 1.获取pending-list中的订单信息
+                    List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
+                            Consumer.from("g1", "c1"),
+                            StreamReadOptions.empty().count(1),
+                            StreamOffset.create(queueName, ReadOffset.from("0"))
+                    );
+                    // 2.判断消息获取是否成功
+                    if(list == null || list.isEmpty()) {
+                        //获取失败
+                        break;
+                    }
+                    // 3.解析订单
+                    MapRecord<String, Object, Object> record = list.get(0);
+                    Map<Object, Object> values = record.getValue();
+                    VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(values, new VoucherOrder(), true);
+                    // 3.创建订单
+                    handleVoucherOrder(voucherOrder);
+                    // 4.ack确认
+                    stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
+                } catch (Exception e) {
+                    log.error("处理pending-list异常", e);
+                    try {
+                        Thread.sleep(20);
+                    } catch (InterruptedException ex) {
+                        throw new RuntimeException(ex);
+                    }
+                }
+            }
+        }
+    }
+
+
+    /*private BlockingQueue <VoucherOrder> voucherOrderQueue = new ArrayBlockingQueue<>(1024 * 1024);
     private class VoucherOrderHandler implements Runnable {
         @Override
         public void run() {
@@ -75,7 +159,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             }
 
         }
-    }
+    }*/
 
     /**
      * 处理订单
@@ -114,6 +198,39 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     public Result seckillVoucher(Long voucherId) {
         // 获取用户id
         Long userId = UserHolder.getUser().getId();
+        // 获取订单id
+        Long orderId = redisIdWorker.nextId("order");
+        // 1.执行lua脚本
+        Long result = stringRedisTemplate.execute(
+                SECKILL_SCRIPT_FOR_MQ,
+                Collections.emptyList(),
+                voucherId.toString(),
+                userId.toString(),
+                String.valueOf(orderId)
+        );
+        // 2.判断结果
+        int resultInt = result.intValue();
+        // 2.1.判断是否为0
+        if(resultInt != 0){
+            // 2.2.不为0则再细分判断问题
+            return Result.fail(resultInt == 1 ? "库存不足!":"不允许重复下单!");
+        }
+
+        // 3.获取代理对象
+        proxy = (IVoucherOrderService) AopContext.currentProxy();
+
+        return Result.ok(orderId);
+    }
+
+    /**
+     * 处理秒杀订单
+     * @param voucherId
+     * @return
+     */
+    /*@Override
+    public Result seckillVoucher(Long voucherId) {
+        // 获取用户id
+        Long userId = UserHolder.getUser().getId();
         // 1.执行lua脚本
         Long result = stringRedisTemplate.execute(
                 SECKILL_SCRIPT,
@@ -146,7 +263,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         proxy = (IVoucherOrderService) AopContext.currentProxy();
 
         return Result.ok(orderId);
-    }
+    }*/
 
    /* @Override
     public Result seckillVoucher(Long voucherId) {
