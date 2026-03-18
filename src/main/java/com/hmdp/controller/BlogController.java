@@ -99,4 +99,17 @@ public class BlogController {
         List<Blog> records = page.getRecords();
         return Result.ok(records);
     }
+
+    /**
+     * 分页查询关注列表的Blog
+     * @param max
+     * @param offset
+     * @return
+     */
+    // 由于offset第一次来的时候是没有的，这里加一个defaultValue防止空指针
+    @GetMapping("/of/follow")
+    public Result queryBlogOfFollow(
+            @RequestParam("lastId") Long max, @RequestParam(value = "offset", defaultValue = "0") Integer offset){
+        return blogService.queryBlogOfFollow(max, offset);
+    }
 }
