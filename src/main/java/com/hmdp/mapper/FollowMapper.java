@@ -2,6 +2,8 @@ package com.hmdp.mapper;
 
 import com.hmdp.entity.Follow;
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+import org.apache.ibatis.annotations.Delete;
+import org.apache.ibatis.annotations.Param;
 
 /**
  * <p>
@@ -13,4 +15,6 @@ import com.baomidou.mybatisplus.core.mapper.BaseMapper;
  */
 public interface FollowMapper extends BaseMapper<Follow> {
 
+    @Delete("delete from tb_follow where user_id = #{userId} and follow_user_id = #{followUserId}")
+    void unfollowByUserId(@Param("userId") Long userId, @Param("followUserId") Long followUserId);
 }
